@@ -1,10 +1,15 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strings"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,17 +29,142 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func reduceName(mapIdx, reduceIdx int) string {
+	return fmt.Sprintf("mr-%d-%d", mapIdx, reduceIdx)
+}
+
+func mergeName(reduceIdx int) string {
+	return fmt.Sprintf("mr-out-%d", reduceIdx)
+}
 
 //
 // main/mrworker.go calls this function.
 //
+
+type worker struct {
+	id      int
+	mapf    func(string, string) []KeyValue
+	reducef func(string, []string) string
+}
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
+	w := worker{}
+	w.mapf = mapf
+	w.reducef = reducef
+	w.run()
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+}
+
+func (w *worker) run() {
+	for {
+		resp := &GetTaskResp{}
+		req := &GetTaskReq{}
+
+		if ok := call("Coordinator.GetTask", req, resp); !ok {
+			os.Exit(1)
+		}
+		task := resp.Task
+		switch task.Phase {
+		case MapPhase:
+			w.doMapTask(task)
+		case ReducePhase:
+			w.doReduceTask(task)
+		}
+	}
+}
+
+func (w *worker) doMapTask(t Task) {
+	req := &ReportTaskReq{Task: t}
+	resp := &ReportTaskResp{}
+
+	file, err := os.Open(t.FileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", t.FileName)
+		return
+	}
+
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", t.FileName)
+		return
+	}
+
+	file.Close()
+
+	kvs := w.mapf(t.FileName, string(content))
+
+	reduces := make([][]KeyValue, t.NReduce)
+	for _, kv := range kvs {
+		idx := ihash(kv.Key) % t.NReduce
+		reduces[idx] = append(reduces[idx], kv)
+	}
+
+	for idx, l := range reduces {
+		fileName := reduceName(t.Id, idx)
+		f, err := os.Create(fileName)
+		if err != nil {
+			log.Printf("%d map task fail,err:%v", req.Task.Id, err)
+			return
+		}
+		enc := json.NewEncoder(f)
+		for _, kv := range l {
+			if err := enc.Encode(&kv); err != nil {
+				log.Printf("%d map task fail,err:%v", req.Task.Id, err)
+				return
+			}
+
+		}
+		if err := f.Close(); err != nil {
+			log.Printf("%d map task fail,err:%v", req.Task.Id, err)
+			return
+		}
+	}
+	log.Printf("worker: %d map task success done", req.Task.Id)
+	call("Coordinator.ReportTask", req, resp)
+}
+
+func (w *worker) doReduceTask(t Task) {
+	maps := make(map[string][]string)
+	req := &ReportTaskReq{Task: t}
+	resp := &ReportTaskResp{}
+	for idx := 0; idx < t.NMap; idx++ {
+		fileName := reduceName(idx, t.Id)
+
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Printf("%d reduce task fail,err:%v", req.Task.Id, err)
+			return
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			if _, ok := maps[kv.Key]; !ok {
+				maps[kv.Key] = make([]string, 0, 100)
+			}
+			maps[kv.Key] = append(maps[kv.Key], kv.Value)
+		}
+	}
+
+	res := make([]string, 0, 100)
+	for k, v := range maps {
+		res = append(res, fmt.Sprintf("%v %v\n", k, w.reducef(k, v)))
+	}
+
+	if err := ioutil.WriteFile(mergeName(t.Id), []byte(strings.Join(res, "")), 0600); err != nil {
+		log.Printf("%d reduce task fail,err:%v", req.Task.Id, err)
+		return
+	}
+
+	call("Coordinator.ReportTask", req, resp)
+	log.Printf("worker:%d reduce task success done", req.Task.Id)
 
 }
 
