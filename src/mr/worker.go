@@ -3,13 +3,13 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
+	"log"
+	"net/rpc"
 	"os"
 	"strings"
 )
-import "log"
-import "net/rpc"
-import "hash/fnv"
 
 //
 // Map functions return a slice of KeyValue.

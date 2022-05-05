@@ -2,13 +2,13 @@ package mr
 
 import (
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
 	"time"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
 const (
 	MapPhase    = "MapPhase"
@@ -22,10 +22,10 @@ type Coordinator struct {
 	NMap    int
 	Phase   string
 
-	wg               sync.WaitGroup
-	TaskDoneChan     []chan Task
-	TaskReadyChan    chan Task
-	TotalJobDoneChan chan struct{}
+	wg               sync.WaitGroup //监控当前阶段所有任务是否完成
+	TaskDoneChan     []chan Task    //已完成任务
+	TaskReadyChan    chan Task      //就绪任务
+	TotalJobDoneChan chan struct{}  //MapReduce结束
 }
 
 type Task struct {
@@ -45,6 +45,7 @@ func (c *Coordinator) initMapTask() {
 			Phase:    c.Phase,
 			NMap:     c.NMap,
 		}
+
 		c.wg.Add(1)
 		c.TaskDoneChan[task.Id] = make(chan Task, 1)
 		c.TaskReadyChan <- task
@@ -60,6 +61,7 @@ func (c *Coordinator) initReduceTask() {
 			Phase:   c.Phase,
 			NMap:    c.NMap,
 		}
+
 		c.wg.Add(1)
 		c.TaskDoneChan[task.Id] = make(chan Task, 1)
 		c.TaskReadyChan <- task
@@ -68,16 +70,21 @@ func (c *Coordinator) initReduceTask() {
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
+	//从未完成任务队列中取一个任务
 	task := <-c.TaskReadyChan
 
+	//起协程监控任务
 	go func() {
 		select {
+		//任务完成
 		case task = <-c.TaskDoneChan[task.Id]:
 			log.Printf("coor:%d %s task  success", task.Id, task.Phase)
 			c.wg.Done()
 			return
+		//任务超时
 		case <-time.After(10 * time.Second):
 			log.Printf("coor:%d %s task  timeout", task.Id, task.Phase)
+			//将超时任务重新放回就绪队列
 			c.TaskReadyChan <- task
 			return
 		}
@@ -166,6 +173,7 @@ func (c *Coordinator) schedule() {
 	c.wg.Wait()
 	log.Printf("coor:all map tasks success done")
 
+	//reduce
 	c.Phase = ReducePhase
 	c.initReduceTask()
 
